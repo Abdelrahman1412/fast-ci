@@ -1,0 +1,266 @@
+name: frontend
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 2 * * *" # nightly: every lane, against main
+  workflow_dispatch:
+    inputs:
+      lanes:
+        description: "Playwright lanes to run ('config' = what fast-ci.toml says for workflow_dispatch)"
+        type: choice
+        default: config
+        options: [config, mock, full, "mock,full"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: frontend
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: .
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      run_mock: ${{ steps.config.outputs.run_mock }}
+      run_full: ${{ steps.config.outputs.run_full }}
+      active_lanes: ${{ steps.config.outputs.active_lanes }}
+      vitest_shards: ${{ steps.config.outputs.vitest_shards }}
+      vitest_shard_list: ${{ steps.config.outputs.vitest_shard_list }}
+      playwright_shards: ${{ steps.config.outputs.playwright_shards }}
+      playwright_shard_list: ${{ steps.config.outputs.playwright_shard_list }}
+      playwright_retries: ${{ steps.config.outputs.playwright_retries }}
+      fail_on_flaky: ${{ steps.config.outputs.fail_on_flaky }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read fast-ci.toml and pick the lanes for this event
+        id: config
+        env:
+          EVENT: ${{ github.event_name }}
+          LANES: ${{ inputs.lanes }}
+        run: |
+          [ "$LANES" = "config" ] && LANES=""
+          python3 scripts/ci_config.py frontend --event "$EVENT" --lanes "$LANES" --github-output
+      - name: Did anything relevant change?
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: ${{ steps.config.outputs.paths_filter }}
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          CHANGED: ${{ steps.filter.outputs.changed }}
+          LANES: ${{ steps.config.outputs.active_lanes }}
+        run: |
+          if [ "$EVENT" != "pull_request" ] || [ "$CHANGED" = "true" ]; then run=true; else run=false; fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "Frontend jobs run: **$run**; Playwright lanes: \`$LANES\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # Build once. Every Playwright shard downloads this dist/ instead of
+  # rebuilding it, which on a real app is minutes per shard.
+  build:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-frontend
+      - run: pnpm typecheck
+      - run: pnpm build
+      - name: Spec guard (every spec file is picked up by a project)
+        run: node ../scripts/check-specs.mjs --dir e2e --suffix .spec.ts --ignore e2e/fixtures --out dist-listed.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: |
+            frontend/dist/
+            frontend/dist-listed.json
+          if-no-files-found: error
+          retention-days: 3
+
+  unit:
+    name: unit (${{ matrix.shard }})
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.vitest_shard_list) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-frontend
+      - name: Vitest shard ${{ matrix.shard }}
+        env:
+          CI: 'true'
+          TOTAL: ${{ needs.plan.outputs.vitest_shards }}
+          SHARD: ${{ matrix.shard }}
+        run: pnpm vitest run --shard="$SHARD/$TOTAL"
+
+  e2e-mock:
+    name: e2e mock (${{ matrix.shard }})
+    needs: [plan, build]
+    if: needs.plan.outputs.run == 'true' && needs.plan.outputs.run_mock == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.playwright_shard_list) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-frontend
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: frontend
+      - name: Browser cache
+        id: browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          # The browser build is pinned by the Playwright version, which the lockfile pins.
+          key: playwright-${{ runner.os }}-${{ hashFiles('frontend/pnpm-lock.yaml') }}
+      - name: Install browsers
+        if: steps.browsers.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Install browser system libraries
+        # The cache holds the browser, not the apt packages it needs.
+        if: steps.browsers.outputs.cache-hit == 'true'
+        run: pnpm exec playwright install-deps chromium
+      - name: Playwright mock lane, shard ${{ matrix.shard }}
+        env:
+          CI: 'true'
+          PW_RETRIES: ${{ needs.plan.outputs.playwright_retries }}
+          PW_FAIL_ON_FLAKY: ${{ needs.plan.outputs.fail_on_flaky == 'true' && '1' || '0' }}
+          SHARD: ${{ matrix.shard }}
+          TOTAL: ${{ needs.plan.outputs.playwright_shards }}
+        run: pnpm exec playwright test --project=mock --shard="$SHARD/$TOTAL"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: blob-mock-${{ matrix.shard }}
+          path: frontend/blob-report/
+          retention-days: 3
+
+  e2e-full:
+    name: e2e full
+    needs: [plan, build]
+    if: needs.plan.outputs.run == 'true' && needs.plan.outputs.run_full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-frontend
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: frontend
+      - name: Browser cache
+        id: browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('frontend/pnpm-lock.yaml') }}
+      - if: steps.browsers.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install --with-deps chromium
+      - if: steps.browsers.outputs.cache-hit == 'true'
+        run: pnpm exec playwright install-deps chromium
+      - name: Playwright full lane
+        env:
+          CI: 'true'
+          E2E_LANE: full
+          PW_RETRIES: ${{ needs.plan.outputs.playwright_retries }}
+          PW_FAIL_ON_FLAKY: ${{ needs.plan.outputs.fail_on_flaky == 'true' && '1' || '0' }}
+        # One worker: the full lane shares one stateful API server.
+        run: pnpm exec playwright test --project=full --workers=1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: blob-full
+          path: frontend/blob-report/
+          retention-days: 3
+
+  # Merges every shard's blob report into one HTML report, and checks that
+  # the shards together ran every listed test of the active lanes.
+  report:
+    needs: [plan, build, e2e-mock, e2e-full]
+    if: >-
+      always() && needs.plan.outputs.run == 'true' && needs.build.result == 'success'
+      && (needs.e2e-mock.result != 'skipped' || needs.e2e-full.result != 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-frontend
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: frontend
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: blob-*
+          path: frontend/blobs
+      - name: Gather blobs under unique names
+        run: |
+          mkdir -p all-blob-reports
+          for dir in blobs/*/; do
+            for zip in "$dir"*.zip; do cp "$zip" "all-blob-reports/$(basename "$dir")-$(basename "$zip")"; done
+          done
+          ls all-blob-reports
+      - name: Merge into one HTML report
+        run: |
+          pnpm exec playwright merge-reports --reporter html ./all-blob-reports
+          pnpm exec playwright merge-reports --reporter json ./all-blob-reports > merged.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          retention-days: 14
+      - name: Every listed test ran, none failed, none flaky
+        env:
+          LANES: ${{ needs.plan.outputs.active_lanes }}
+        run: |
+          projects=$(python3 -c 'import json,sys; print(",".join(json.loads(sys.argv[1])))' "$LANES")
+          node ../scripts/check-playwright-run.mjs --report merged.json --listed dist-listed.json --projects "$projects"
+
+  ci-result:
+    name: CI result
+    needs: [plan, build, unit, e2e-mock, e2e-full, report]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+      - name: Judge every job
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          RUN_MOCK: ${{ needs.plan.outputs.run_mock }}
+          RUN_FULL: ${{ needs.plan.outputs.run_full }}
+        run: |
+          # A lane the config turned off may be skipped; a lane that should run may not.
+          may_skip=""
+          [ "$RUN_MOCK" = "true" ] || may_skip="$may_skip,e2e-mock"
+          [ "$RUN_FULL" = "true" ] || may_skip="$may_skip,e2e-full"
+          python3 scripts/ci_result.py --plan plan --may-skip "$may_skip"

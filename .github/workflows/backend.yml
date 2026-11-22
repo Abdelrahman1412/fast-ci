@@ -1,0 +1,268 @@
+name: backend
+
+# No `paths:` filter here on purpose. A required check from a workflow that
+# never starts stays "pending" and blocks the merge. The plan job decides what
+# to run instead, and "CI result" always reports.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly run on main refreshes the durations artifact and warms the caches.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+# A new push to a pull request cancels the run it replaces. Runs on main are
+# never cancelled, so every merge gets a complete result and fresh caches.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  actions: read # to download the durations artifact from an earlier run
+
+env:
+  PGHOST: 127.0.0.1
+  PGPORT: 5432
+  PGUSER: postgres
+  PGPASSWORD: postgres
+  FASTCI_BASE_DB: acme_test_base
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      shard_list: ${{ steps.config.outputs.shard_list }}
+      shards: ${{ steps.config.outputs.shards }}
+      group_by: ${{ steps.config.outputs.group_by }}
+      reruns: ${{ steps.config.outputs.reruns }}
+      rerun_policy: ${{ steps.config.outputs.rerun_policy }}
+      durations_artifact: ${{ steps.config.outputs.durations_artifact }}
+      durations_file: ${{ steps.config.outputs.durations_file }}
+      migrate_command: ${{ steps.config.outputs.migrate_command }}
+      migration_fingerprint: ${{ steps.config.outputs.migration_fingerprint }}
+      postgres_image: ${{ steps.config.outputs.postgres_image }}
+      python_files: ${{ steps.config.outputs.python_files }}
+      tests: ${{ steps.config.outputs.tests }}
+      collection_ignore: ${{ steps.config.outputs.collection_ignore }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read fast-ci.toml
+        id: config
+        run: python3 scripts/ci_config.py backend --github-output
+      - name: Did anything relevant change?
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: ${{ steps.config.outputs.paths_filter }}
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          CHANGED: ${{ steps.filter.outputs.changed }}
+        run: |
+          if [ "$EVENT" != "pull_request" ] || [ "$CHANGED" = "true" ]; then run=true; else run=false; fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "Backend jobs run: **$run** (event $EVENT, relevant paths changed: ${CHANGED:-n/a})" >> "$GITHUB_STEP_SUMMARY"
+
+  lint:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-backend
+      - name: Ruff
+        run: |
+          backend/.venv/bin/ruff check .
+          backend/.venv/bin/ruff format --check .
+      - name: Tests for the CI scripts themselves
+        working-directory: scripts
+        run: uv run --project ../backend pytest
+
+  # Builds the migrated template database once per migration set and caches
+  # its dump. Shards start after this job, so they always find the cache.
+  test-db:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    # A from-scratch migration that hangs should fail here, quickly and by
+    # name, not as eight shard timeouts.
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: ${{ needs.plan.outputs.postgres_image }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-backend
+      - uses: ./.github/actions/test-db
+        with:
+          fingerprint: ${{ needs.plan.outputs.migration_fingerprint }}
+          migrate-command: ${{ needs.plan.outputs.migrate_command }}
+          postgres-container: ${{ job.services.postgres.id }}
+          save: 'true'
+
+  # Collects once, fails on test files that would never run, and splits the
+  # collected tests into duration-balanced shard files.
+  collect:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-backend
+      - name: Collection guard
+        working-directory: backend
+        env:
+          TESTS: ${{ needs.plan.outputs.tests }}
+          PYTHON_FILES: ${{ needs.plan.outputs.python_files }}
+          IGNORE: ${{ needs.plan.outputs.collection_ignore }}
+        run: |
+          to_args() { python3 -c 'import json,sys; print(" ".join(json.loads(sys.argv[1])))' "$1"; }
+          # shellcheck disable=SC2046
+          uv run python ../scripts/check_collection.py --root . \
+            --tests $(to_args "$TESTS") --python-files $(to_args "$PYTHON_FILES") \
+            --ignore $(to_args "$IGNORE") --pytest "uv run python -m pytest" --out ../ci/collected.txt
+      - name: Fetch the latest durations from main
+        id: durations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT: ${{ needs.plan.outputs.durations_artifact }}
+          COMMITTED: backend/${{ needs.plan.outputs.durations_file }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          mkdir -p ci
+          run_id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow backend.yml --branch "$DEFAULT_BRANCH" \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty' || true)
+          if [ -n "$run_id" ] && gh run download "$run_id" -R "$GITHUB_REPOSITORY" -n "$ARTIFACT" -D ci/artifact 2>/dev/null; then
+            cp ci/artifact/*.json ci/durations.json
+            echo "source=artifact from run $run_id" >> "$GITHUB_OUTPUT"
+          elif [ -f "$COMMITTED" ]; then
+            cp "$COMMITTED" ci/durations.json
+            echo "source=committed $COMMITTED" >> "$GITHUB_OUTPUT"
+          else
+            echo '{}' > ci/durations.json
+            echo "source=none (splitting by count)" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Split by duration
+        env:
+          SHARDS: ${{ needs.plan.outputs.shards }}
+          GROUP_BY: ${{ needs.plan.outputs.group_by }}
+          SOURCE: ${{ steps.durations.outputs.source }}
+        run: |
+          python3 scripts/split_tests.py --tests ci/collected.txt --durations ci/durations.json \
+            --shards "$SHARDS" --group-by "$GROUP_BY" --out ci/shards | tee ci/split.txt
+          { echo "### Shard plan (durations: $SOURCE)"; echo '```'; cat ci/split.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-shard-plan
+          path: ci/
+          retention-days: 7
+
+  test:
+    name: test (${{ matrix.shard }})
+    needs: [plan, test-db, collect]
+    if: needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # Every shard finishes, so one red run shows all failures at once.
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shard_list) }}
+    services:
+      postgres:
+        image: ${{ needs.plan.outputs.postgres_image }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-backend
+      - uses: ./.github/actions/test-db
+        with:
+          fingerprint: ${{ needs.plan.outputs.migration_fingerprint }}
+          migrate-command: ${{ needs.plan.outputs.migrate_command }}
+          postgres-container: ${{ job.services.postgres.id }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: backend-shard-plan
+          path: ci
+      - name: Run shard ${{ matrix.shard }}
+        working-directory: backend
+        env:
+          FASTCI_SHARD: ${{ matrix.shard }}
+          FASTCI_REQUIRE_TEMPLATE: '1'
+          RERUNS: ${{ needs.plan.outputs.reruns }}
+        run: |
+          uv run pytest "@../ci/shards/shard-${FASTCI_SHARD}.txt" --reruns "$RERUNS" \
+            --honest-report="../ci/reports/shard-${FASTCI_SHARD}.json" -p no:cacheprovider
+      - name: Upload the shard's run record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: honest-report-${{ matrix.shard }}
+          path: ci/reports/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Proves the shards together ran exactly the collected tests, applies the
+  # rerun policy, and publishes merged durations for the next split.
+  gate:
+    needs: [plan, collect, test]
+    if: always() && needs.plan.outputs.run == 'true' && needs.collect.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: backend-shard-plan
+          path: ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: honest-report-*
+          path: ci/reports
+          merge-multiple: true
+      - name: Honest CI gate
+        env:
+          POLICY: ${{ needs.plan.outputs.rerun_policy }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
+        run: |
+          python3 scripts/honest_gate.py --collected ci/collected.txt --reports ci/reports \
+            --reruns-policy "$POLICY" --expected-shards "$SHARDS" --durations-out ci/test_durations.json
+      - name: Publish merged durations
+        if: always() && hashFiles('ci/test_durations.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.plan.outputs.durations_artifact }}
+          path: ci/test_durations.json
+          retention-days: 30
+
+  ci-result:
+    name: CI result
+    needs: [plan, lint, test-db, collect, test, gate]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+      - name: Judge every job
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci_result.py --plan plan

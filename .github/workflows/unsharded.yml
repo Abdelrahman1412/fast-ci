@@ -1,0 +1,86 @@
+name: unsharded
+
+# Manual baseline for timing comparisons: each suite in a single job, no
+# sharding, same runner type. Compare with scripts/ci-timings.py, e.g.
+#   scripts/ci-timings.py --repo OWNER/REPO --workflow unsharded.yml --runs 5
+#   scripts/ci-timings.py --repo OWNER/REPO --workflow backend.yml --runs 5
+on:
+  workflow_dispatch:
+    inputs:
+      playwright_workers:
+        description: Playwright workers in the single job
+        default: "2"
+
+permissions:
+  contents: read
+
+env:
+  PGHOST: 127.0.0.1
+  PGPORT: 5432
+  PGUSER: postgres
+  PGPASSWORD: postgres
+  FASTCI_BASE_DB: acme_test_base
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-backend
+      - name: Read fast-ci.toml
+        id: config
+        run: python3 scripts/ci_config.py backend --github-output
+      - name: Build the test database from scratch (no cache)
+        working-directory: backend
+        env:
+          FASTCI_FINGERPRINT: ${{ steps.config.outputs.migration_fingerprint }}
+          FASTCI_MIGRATE_CMD: ${{ steps.config.outputs.migrate_command }}
+          FASTCI_DUMP: ${{ github.workspace }}/.cache/test-db/base.dump
+          FASTCI_PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: ../scripts/test_db.sh build
+      - name: Whole suite, one job
+        working-directory: backend
+        env:
+          FASTCI_REQUIRE_TEMPLATE: '1'
+        run: |
+          start=$(date +%s)
+          uv run pytest -p no:cacheprovider
+          echo "Backend suite, unsharded: $(( $(date +%s) - start ))s" >> "$GITHUB_STEP_SUMMARY"
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-frontend
+      - run: pnpm build
+      - run: pnpm exec playwright install --with-deps chromium
+      - name: Vitest, one job
+        env:
+          CI: 'true'
+        run: |
+          start=$(date +%s)
+          pnpm vitest run
+          echo "Vitest, unsharded: $(( $(date +%s) - start ))s" >> "$GITHUB_STEP_SUMMARY"
+      - name: Playwright, every lane, one job
+        env:
+          CI: 'true'
+          E2E_LANE: full
+          PW_WORKERS: ${{ inputs.playwright_workers }}
+        run: |
+          start=$(date +%s)
+          pnpm exec playwright test --project=mock
+          pnpm exec playwright test --project=full --workers=1
+          echo "Playwright mock + full, unsharded: $(( $(date +%s) - start ))s" >> "$GITHUB_STEP_SUMMARY"

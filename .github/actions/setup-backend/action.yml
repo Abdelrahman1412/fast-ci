@@ -1,0 +1,20 @@
+name: Set up the backend
+description: Install uv and the backend's locked dependencies, with the uv cache keyed on the lockfile.
+inputs:
+  working-directory:
+    description: Directory holding pyproject.toml and uv.lock.
+    default: backend
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
+        # Key on the lockfile only. Keying on pyproject.toml as well would miss
+        # nothing, but keying on a glob that matches no file gives one shared,
+        # never-invalidated cache.
+        cache-dependency-glob: ${{ inputs.working-directory }}/uv.lock
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: uv sync --frozen

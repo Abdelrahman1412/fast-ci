@@ -1,0 +1,57 @@
+name: Migrated test database
+description: >-
+  Restore the migrated template database from the Actions cache, or build and
+  dump it on a miss. The cache key is the migration fingerprint, and the same
+  fingerprint is stamped inside the dump, so a stale dump is refused.
+inputs:
+  fingerprint:
+    description: Output of scripts/fingerprint.py over every migration input.
+    required: true
+  migrate-command:
+    description: Command that migrates $DATABASE_URL.
+    required: true
+  working-directory:
+    description: Directory the migrate command runs from.
+    default: backend
+  save:
+    description: "'true' to save the dump to the cache after a build (one job per run should do this)."
+    default: 'false'
+  postgres-container:
+    description: Service container id, so pg_dump/pg_restore match the server version.
+    default: ''
+outputs:
+  status:
+    description: hit, miss or stale
+    value: ${{ steps.ensure.outputs.status }}
+runs:
+  using: composite
+  steps:
+    - name: Restore dump (and save it after a build)
+      if: inputs.save == 'true'
+      uses: actions/cache@v4
+      with:
+        path: .cache/test-db
+        key: fastci-test-db-${{ inputs.fingerprint }}
+    - name: Restore dump
+      if: inputs.save != 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: .cache/test-db
+        key: fastci-test-db-${{ inputs.fingerprint }}
+    - name: Restore or build the template database
+      id: ensure
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        FASTCI_FINGERPRINT: ${{ inputs.fingerprint }}
+        FASTCI_MIGRATE_CMD: ${{ inputs.migrate-command }}
+        FASTCI_DUMP: ${{ github.workspace }}/.cache/test-db/base.dump
+        FASTCI_PG_CONTAINER: ${{ inputs.postgres-container }}
+      run: |
+        status=$("$GITHUB_WORKSPACE/scripts/test_db.sh" ensure)
+        echo "status=$status" >> "$GITHUB_OUTPUT"
+        case "$status" in
+          hit) echo "Test database restored from cache (fingerprint $FASTCI_FINGERPRINT)." ;;
+          *) echo "::warning title=Test database rebuilt::cache $status for fingerprint $FASTCI_FINGERPRINT; migrations ran from scratch" ;;
+        esac
+        echo "Test database: **$status** (fingerprint \`$FASTCI_FINGERPRINT\`)" >> "$GITHUB_STEP_SUMMARY"
