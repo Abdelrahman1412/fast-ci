@@ -1,0 +1,60 @@
+# fast-ci configuration: worked example for Acme HR, a fictional company.
+#
+# The workflows read this file in their first job (scripts/ci_config.py) and
+# pass the values on as job outputs. Change a number here, not in the YAML.
+
+[backend]
+# Directory the backend tests run from, relative to the repo root.
+root = "backend"
+# Test roots and pytest's python_files patterns, used by the collection guard.
+tests = ["tests"]
+python_files = ["test_*.py"]
+# Files under the test roots that may define test-like functions but are not
+# test modules (glob, relative to root). Everything else must be collected.
+collection_ignore = []
+# Number of parallel test jobs. Wall clock ~ total test time / shards + fixed
+# cost per job (checkout, install, database restore). Past the point where the
+# fixed cost dominates, more shards only cost money.
+shards = 4
+# "test" balances best. "file" keeps each file on one shard, which is cheaper
+# when files share expensive module-scoped fixtures, but one slow file then
+# decides the wall clock.
+group_by = "test"
+# Retries per failing test (pytest-rerunfailures). 0 disables retries.
+reruns = 1
+# A test that fails and then passes on retry is flaky. "fail" fails the run,
+# "warn" reports it loudly and lets the run pass, "allow" only counts it.
+rerun_policy = "fail"
+# Where the merged durations from main are published, and the committed
+# fallback used when no artifact is available yet.
+durations_artifact = "backend-test-durations"
+durations_file = ".test_durations.json"
+# Everything that shapes the migrated test database. The hash of these files
+# (plus the Postgres major) is the cache key and is stamped into the dump.
+migration_inputs = ["migrations/*.sql", "app/migrate.py"]
+migrate_command = "uv run python -m app.migrate"
+postgres_image = "postgres:17"
+postgres_major = 17
+# Paths whose changes make the backend jobs run. Anything else skips them.
+paths = ["backend/**", "scripts/**", "fast-ci.toml", ".github/workflows/backend.yml", ".github/actions/**"]
+
+[frontend]
+root = "frontend"
+vitest_shards = 2
+playwright_shards = 3
+browsers = ["chromium"]
+# Playwright retries. With fail_on_flaky = true a test that only passes on a
+# retry fails the run (Playwright's failOnFlakyTests).
+playwright_retries = 1
+fail_on_flaky = true
+paths = ["frontend/**", "scripts/**", "fast-ci.toml", ".github/workflows/frontend*.yml"]
+
+# Which Playwright lanes run for each trigger. "mock" stubs every API call in
+# the browser and needs nothing else running; "full" runs against a real API
+# server. Keep pull requests on the fast lane and run everything on merge and
+# at night.
+[frontend.lanes]
+pull_request = ["mock"]
+push = ["mock", "full"]
+schedule = ["mock", "full"]
+workflow_dispatch = ["mock", "full"]
