@@ -1,0 +1,13 @@
+:root { font-family: system-ui, sans-serif; color: #1d2433; background: #f6f7f9; }
+body { margin: 0; }
+header { background: #1d2433; color: #fff; padding: 12px 24px; display: flex; gap: 24px; align-items: center; }
+header a { color: #c9d3e6; text-decoration: none; }
+header a[aria-current="page"] { color: #fff; font-weight: 600; }
+main { padding: 24px; max-width: 960px; margin: 0 auto; }
+table { width: 100%; border-collapse: collapse; background: #fff; }
+th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e3e6ec; }
+form { display: grid; gap: 8px; max-width: 420px; background: #fff; padding: 16px; }
+.error { color: #b42318; }
+.notice { color: #067647; }
+.empty { color: #667085; font-style: italic; }
+.card { background: #fff; padding: 16px; margin-bottom: 16px; }

@@ -1,0 +1,38 @@
+[project]
+name = "acme-hr-api"
+version = "0.1.0"
+description = "Demo HR service used to prove the fast-ci patterns."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.165.0",
+    "psycopg[binary]>=3.3.9",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.2.0",
+    "pytest-rerunfailures>=16.7",
+    "ruff>=0.17.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# Honest-CI defaults: a typo in a marker or an ini key is an error, and an
+# xfail that starts passing fails the run instead of hiding.
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+pythonpath = ["."]
+xfail_strict = true
+filterwarnings = [
+    "error",
+    # Third-party notice about the test client transport; not ours to fix.
+    "ignore:Using `httpx` with `starlette.testclient`:Warning",
+]
+markers = [
+    "db: the test uses the Postgres test database",
+    "slow: the test takes noticeably longer than the rest",
+]
