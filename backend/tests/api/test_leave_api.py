@@ -38,7 +38,7 @@ def test_days_are_counted_server_side(client, emp, start, end, weekend, days):
 
 
 def test_weekend_only_request_is_rejected(client, emp):
-    assert request(client, emp["id"], "2026-11-07", "2026-11-08").status_code == 422
+    assert request(client, emp["id"], "2026-11-07", "2026-11-08").status_code == 409
 
 
 @pytest.mark.parametrize(
@@ -99,7 +99,7 @@ def test_insufficient_balance(client, conn):
     first = request(client, new_joiner["id"], "2026-11-02", "2026-11-06").json()
     client.post(f"/leave-requests/{first['id']}/approve")
     res = request(client, new_joiner["id"], "2026-11-16", "2026-11-20")
-    assert res.status_code == 422
+    assert res.status_code == 409
     assert res.json()["detail"] == "insufficient balance"
 
 

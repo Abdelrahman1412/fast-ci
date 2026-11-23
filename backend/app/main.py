@@ -4,17 +4,59 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Match
 
 from app import leave, payroll
 from app.db import get_conn
-from app.schemas import EmployeeIn, EmployeeOut, LeaveIn, LeaveOut, PayrollRunIn
+from app.schemas import (
+    INT4_MAX,
+    DepartmentIn,
+    DepartmentOut,
+    EmployeeIn,
+    EmployeeOut,
+    EmployeeStatus,
+    ErrorOut,
+    IsoDate,
+    LeaveIn,
+    LeaveOut,
+    LeaveStatus,
+    PayrollRunIn,
+    TerminateIn,
+)
 
 app = FastAPI(title="Acme HR demo API")
 Conn = Annotated[psycopg.Connection, Depends(get_conn)]
+PathId = Annotated[int, Path(ge=1, le=INT4_MAX)]
+QueryId = Annotated[int | None, Query(ge=1, le=INT4_MAX)]
+
+# Status codes: 422 means the request breaks the published schema (FastAPI's
+# validation shape). A request that fits the schema but breaks a business rule
+# gets 409; a referenced record that does not exist gets 404.
+NOT_FOUND = {404: {"model": ErrorOut, "description": "Not found"}}
+BAD_BODY = {400: {"model": ErrorOut, "description": "Body is not valid JSON"}}
+CONFLICT = {409: {"model": ErrorOut, "description": "Breaks a business rule"}}
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    headers = dict(exc.headers or {})
+    if exc.status_code == 405:
+        # Starlette lists only the first matching route's methods; list every route on the path.
+        allowed = {
+            method
+            for route in request.app.router.routes
+            if isinstance(route, APIRoute) and route.matches(request.scope)[0] != Match.NONE
+            for method in route.methods
+        }
+        headers["Allow"] = ", ".join(sorted(allowed))
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=headers)
 
 
 def audit(conn: psycopg.Connection, entity: str, entity_id: int, action: str) -> None:
@@ -26,21 +68,19 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/departments")
+@app.get("/departments", response_model=list[DepartmentOut])
 def list_departments(conn: Conn) -> list[dict]:
     return conn.execute("SELECT id, name, cost_center FROM departments ORDER BY name").fetchall()
 
 
-@app.post("/departments", status_code=201)
-def create_department(body: dict, conn: Conn) -> dict:
-    name = str(body.get("name", "")).strip()
-    if not name:
-        raise HTTPException(422, "name is required")
+@app.post("/departments", response_model=DepartmentOut, status_code=201, responses={**BAD_BODY, **CONFLICT})
+def create_department(body: DepartmentIn, conn: Conn) -> dict:
+    name = body.name.strip()
     with conn.transaction():
         try:
             row = conn.execute(
                 "INSERT INTO departments (name, cost_center) VALUES (%s, %s) RETURNING id, name, cost_center",
-                (name, str(body.get("cost_center", "CC-000"))),
+                (name, body.cost_center),
             ).fetchone()
         except psycopg.errors.UniqueViolation:
             raise HTTPException(409, "department exists") from None
@@ -50,8 +90,8 @@ def create_department(body: dict, conn: Conn) -> dict:
 @app.get("/employees", response_model=list[EmployeeOut])
 def list_employees(
     conn: Conn,
-    department_id: int | None = None,
-    status: str | None = None,
+    department_id: QueryId = None,
+    status: EmployeeStatus | None = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
 ) -> list[dict]:
     sql = "SELECT * FROM employees WHERE TRUE"
@@ -67,15 +107,15 @@ def list_employees(
     return conn.execute(sql, args).fetchall()
 
 
-@app.get("/employees/{employee_id}", response_model=EmployeeOut)
-def get_employee(employee_id: int, conn: Conn) -> dict:
+@app.get("/employees/{employee_id}", response_model=EmployeeOut, responses=NOT_FOUND)
+def get_employee(employee_id: PathId, conn: Conn) -> dict:
     row = conn.execute("SELECT * FROM employees WHERE id = %s", (employee_id,)).fetchone()
     if row is None:
         raise HTTPException(404, "employee not found")
     return row
 
 
-@app.post("/employees", response_model=EmployeeOut, status_code=201)
+@app.post("/employees", response_model=EmployeeOut, status_code=201, responses={**BAD_BODY, **NOT_FOUND, **CONFLICT})
 def create_employee(body: EmployeeIn, conn: Conn) -> dict:
     with conn.transaction():
         try:
@@ -92,20 +132,22 @@ def create_employee(body: EmployeeIn, conn: Conn) -> dict:
         except psycopg.errors.UniqueViolation:
             raise HTTPException(409, "employee number or email already used") from None
         except psycopg.errors.ForeignKeyViolation:
-            raise HTTPException(422, "unknown department") from None
+            raise HTTPException(404, "department not found") from None
         audit(conn, "employee", row["id"], "create")
     return row
 
 
-@app.post("/employees/{employee_id}/terminate", response_model=EmployeeOut)
-def terminate_employee(employee_id: int, body: dict, conn: Conn) -> dict:
-    end = date.fromisoformat(str(body.get("end_date")))
+@app.post(
+    "/employees/{employee_id}/terminate", response_model=EmployeeOut, responses={**BAD_BODY, **NOT_FOUND, **CONFLICT}
+)
+def terminate_employee(employee_id: PathId, body: TerminateIn, conn: Conn) -> dict:
+    end = body.end_date
     with conn.transaction():
         emp = get_employee(employee_id, conn)
         if emp["status"] == "terminated":
             raise HTTPException(409, "already terminated")
         if end < emp["hire_date"]:
-            raise HTTPException(422, "end_date is before hire_date")
+            raise HTTPException(409, "end_date is before hire_date")
         row = conn.execute(
             "UPDATE employees SET status = 'terminated', end_date = %s WHERE id = %s RETURNING *",
             (end, employee_id),
@@ -119,8 +161,8 @@ def _holidays(conn: psycopg.Connection, start: date, end: date) -> list[date]:
     return [r["day"] for r in rows]
 
 
-@app.post("/leave-requests", response_model=LeaveOut, status_code=201)
-def create_leave(body: LeaveIn, conn: Conn, weekend: str = "sat-sun") -> dict:
+@app.post("/leave-requests", response_model=LeaveOut, status_code=201, responses={**BAD_BODY, **NOT_FOUND, **CONFLICT})
+def create_leave(body: LeaveIn, conn: Conn, weekend: Literal["sat-sun", "fri-sat", "fri"] = "sat-sun") -> dict:
     with conn.transaction():
         emp = get_employee(body.employee_id, conn)
         if emp["status"] == "terminated":
@@ -129,7 +171,7 @@ def create_leave(body: LeaveIn, conn: Conn, weekend: str = "sat-sun") -> dict:
             body.start_date, body.end_date, weekend=weekend, holidays=_holidays(conn, body.start_date, body.end_date)
         )
         if days == 0:
-            raise HTTPException(422, "request covers no working days")
+            raise HTTPException(409, "request covers no working days")
         overlap = conn.execute(
             """SELECT 1 FROM leave_requests WHERE employee_id = %s AND status IN ('pending', 'approved')
                AND start_date <= %s AND end_date >= %s""",
@@ -149,7 +191,7 @@ def create_leave(body: LeaveIn, conn: Conn, weekend: str = "sat-sun") -> dict:
             ).fetchone()["taken"]
             year_end = date(body.start_date.year, 12, 31)
             if days > leave.balance(annual, emp["hire_date"], year_end, int(taken)):
-                raise HTTPException(422, "insufficient balance")
+                raise HTTPException(409, "insufficient balance")
         row = conn.execute(
             """INSERT INTO leave_requests (employee_id, leave_type, start_date, end_date, days, reason)
                VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
@@ -173,23 +215,23 @@ def _transition(conn: psycopg.Connection, leave_id: int, target: str, allowed: s
     return row
 
 
-@app.post("/leave-requests/{leave_id}/approve", response_model=LeaveOut)
-def approve_leave(leave_id: int, conn: Conn) -> dict:
+@app.post("/leave-requests/{leave_id}/approve", response_model=LeaveOut, responses={**NOT_FOUND, **CONFLICT})
+def approve_leave(leave_id: PathId, conn: Conn) -> dict:
     return _transition(conn, leave_id, "approved", {"pending"})
 
 
-@app.post("/leave-requests/{leave_id}/reject", response_model=LeaveOut)
-def reject_leave(leave_id: int, conn: Conn) -> dict:
+@app.post("/leave-requests/{leave_id}/reject", response_model=LeaveOut, responses={**NOT_FOUND, **CONFLICT})
+def reject_leave(leave_id: PathId, conn: Conn) -> dict:
     return _transition(conn, leave_id, "rejected", {"pending"})
 
 
-@app.post("/leave-requests/{leave_id}/cancel", response_model=LeaveOut)
-def cancel_leave(leave_id: int, conn: Conn) -> dict:
+@app.post("/leave-requests/{leave_id}/cancel", response_model=LeaveOut, responses={**NOT_FOUND, **CONFLICT})
+def cancel_leave(leave_id: PathId, conn: Conn) -> dict:
     return _transition(conn, leave_id, "cancelled", {"pending", "approved"})
 
 
 @app.get("/leave-requests", response_model=list[LeaveOut])
-def list_leave(conn: Conn, employee_id: int | None = None, status: str | None = None) -> list[dict]:
+def list_leave(conn: Conn, employee_id: QueryId = None, status: LeaveStatus | None = None) -> list[dict]:
     sql = "SELECT * FROM leave_requests WHERE TRUE"
     args: list = []
     if employee_id is not None:
@@ -215,7 +257,7 @@ def _unpaid_days(conn: psycopg.Connection, period: date) -> dict[int, int]:
     return {r["employee_id"]: int(r["days"]) for r in rows}
 
 
-@app.post("/payroll-runs", status_code=201)
+@app.post("/payroll-runs", status_code=201, responses={**BAD_BODY, **CONFLICT})
 def create_payroll_run(body: PayrollRunIn, conn: Conn) -> dict:
     period = body.period
     last = period.replace(day=payroll.days_in_month(period))
@@ -263,8 +305,8 @@ def create_payroll_run(body: PayrollRunIn, conn: Conn) -> dict:
     return {**run, **totals}
 
 
-@app.post("/payroll-runs/{run_id}/approve")
-def approve_run(run_id: int, conn: Conn) -> dict:
+@app.post("/payroll-runs/{run_id}/approve", responses=CONFLICT)
+def approve_run(run_id: PathId, conn: Conn) -> dict:
     with conn.transaction():
         row = conn.execute(
             "UPDATE payroll_runs SET status = 'approved' WHERE id = %s AND status = 'draft' RETURNING id, status",
@@ -276,7 +318,7 @@ def approve_run(run_id: int, conn: Conn) -> dict:
 
 
 @app.get("/payroll-runs/{run_id}/payslips")
-def list_payslips(run_id: int, conn: Conn) -> list[dict]:
+def list_payslips(run_id: PathId, conn: Conn) -> list[dict]:
     return conn.execute(
         "SELECT employee_id, gross, unpaid_days, social_ins, tax, net FROM payslips "
         "WHERE run_id = %s ORDER BY employee_id",
@@ -285,7 +327,7 @@ def list_payslips(run_id: int, conn: Conn) -> list[dict]:
 
 
 @app.get("/reports/headcount")
-def headcount(conn: Conn, as_of: date | None = None) -> list[dict]:
+def headcount(conn: Conn, as_of: IsoDate | None = None) -> list[dict]:
     day = as_of or date.today()
     return conn.execute(
         """SELECT d.name AS department, COUNT(e.id) AS headcount,
@@ -298,8 +340,8 @@ def headcount(conn: Conn, as_of: date | None = None) -> list[dict]:
     ).fetchall()
 
 
-@app.get("/reports/fx")
-def fx(conn: Conn, currency: str, start: date, end: date) -> dict:
+@app.get("/reports/fx", responses=NOT_FOUND)
+def fx(conn: Conn, currency: Annotated[str, Query(pattern=r"^[A-Za-z]{3}$")], start: IsoDate, end: IsoDate) -> dict:
     row = conn.execute(
         "SELECT COUNT(*) AS days, AVG(rate) AS average FROM exchange_rates "
         "WHERE currency = %s AND day BETWEEN %s AND %s",

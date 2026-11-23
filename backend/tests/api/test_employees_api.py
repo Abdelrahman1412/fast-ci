@@ -46,8 +46,8 @@ def test_duplicates_are_rejected(client, conn, field):
     assert client.post("/employees", json=clash).status_code == 409
 
 
-def test_unknown_department_is_422(client):
-    assert client.post("/employees", json=body(999_999)).status_code == 422
+def test_unknown_department_is_404(client):
+    assert client.post("/employees", json=body(999_999)).status_code == 404
 
 
 @pytest.mark.parametrize(
@@ -105,7 +105,7 @@ def test_terminate(client, conn):
 
 def test_terminate_before_hire_is_rejected(client, conn):
     emp = factories.employee(conn, hire_date=date(2026, 5, 1))
-    assert client.post(f"/employees/{emp['id']}/terminate", json={"end_date": "2026-04-30"}).status_code == 422
+    assert client.post(f"/employees/{emp['id']}/terminate", json={"end_date": "2026-04-30"}).status_code == 409
 
 
 def test_departments_round_trip(client):
