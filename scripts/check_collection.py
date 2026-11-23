@@ -102,7 +102,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = args.root.resolve()
-    data = collect(root, args.tests, args.pytest.split(), args.pytest_args)
+    # Ignored files are kept out of the collection too, so they never land in a shard file.
+    # pytest matches --ignore-glob against absolute paths.
+    ignore_args = [f"--ignore-glob={root / pat}" for pat in args.ignore]
+    data = collect(root, args.tests, args.pytest.split(), [*ignore_args, *args.pytest_args])
     collected: list[str] = data["collected"]
     collected_files = {nodeid.split("::", 1)[0] for nodeid in collected}
     candidates = candidate_files(root, args.tests, args.ignore)

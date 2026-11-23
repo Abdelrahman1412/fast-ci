@@ -43,9 +43,10 @@ a retry. Adding shards is a config change, not a branch-protection change.
 | `.github/workflows/backend.yml` | plan → test-db + collect → sharded tests → honest gate → CI result |
 | `.github/workflows/frontend.yml` | plan → build once → Vitest shards + Playwright shards (merged report) → CI result |
 | `.github/workflows/unsharded.yml` | Manual single-job baseline for timing comparisons. |
+| `.github/workflows/api-fuzz.yml` | Nightly deep API fuzz: 1,000 generated requests per operation. |
 | `.github/actions/` | Composite actions: uv setup, pnpm setup, migrated test database. |
 | `scripts/` | The tools the workflows call. Each one runs locally too. |
-| `backend/` | Demo HR service: FastAPI + Postgres, 390 tests, some deliberately DB-heavy. |
+| `backend/` | Demo HR service: FastAPI + Postgres, 390 tests, some deliberately DB-heavy, plus a schema-driven API fuzzer. |
 | `frontend/` | Demo HR web app: Vite + TypeScript, 223 Vitest tests, Playwright mock and full lanes. |
 | `docs/playbook.md` | How to profile a slow CI, each technique with when it helps and when it does not, and the traps. |
 
@@ -54,7 +55,7 @@ The scripts:
 | Script | Job |
 |---|---|
 | `fingerprint.py`, `test_db.sh` | Hash every input of the test schema; build, dump, restore and verify the template database. |
-| `check_collection.py` | Fail when a file defines tests that pytest never collects (bad name, import error, module-level skip). |
+| `check_collection.py` | Fail when a file defines tests that pytest never collects (bad name, import error, module-level skip). Suites in `collection_ignore` stay out of the shards. |
 | `split_tests.py` | Split collected tests into shards of equal duration. Warn when one file is longer than a whole shard. |
 | `pytest_honest.py` | pytest plugin: record what each shard collected, ran, retried and how long it took. |
 | `honest_gate.py` | Prove the shards together ran exactly the collected tests; apply the retry policy; merge durations. |
@@ -194,6 +195,45 @@ The guards, from `scripts/demo-traps.sh`:
 test-db: dump is stale: it holds fingerprint 'c59754441c7eafddf0a4', the code expects '7ff635d51cf4be6ef1c6'
 all four traps were caught
 ```
+
+## API fuzzing
+
+Example tests check the requests someone thought to write.
+`backend/tests/fuzz/test_api_fuzz.py` uses
+[Schemathesis](https://schemathesis.readthedocs.io) to generate requests from
+the OpenAPI schema, valid and invalid, for every operation. Each response is
+checked: no 5xx, a documented status code, a body that matches the documented
+model, valid input accepted, invalid input refused. It runs in-process against
+the per-worker test database inside a rolled-back transaction, so it needs no
+server and leaves no rows behind.
+
+Pushes run 25 requests per operation in an `api-fuzz` job that the single
+"CI result" check requires. The nightly `api-fuzz` workflow runs 1,000.
+
+It cannot run inside the shards: Schemathesis creates its tests at run time,
+so pytest cannot select them by node id from a shard file. The first local run
+proved it, with every shard failing on "not found". The suite is listed in
+`collection_ignore`, which keeps it out of the shard files, and runs in its own
+job instead.
+
+The demo API had 390 passing tests. The fuzzer's first runs failed 14 of its
+17 operations. What it found:
+
+| Found | Before | Now |
+|---|---|---|
+| Terminate with an empty body | 500 | 422 |
+| `{"period": 0}` | **Created a payroll run for January 1970** (0 read as a Unix timestamp) | 422; dates must be ISO strings |
+| An id above 2,147,483,647 | 500 from Postgres | 422 at the edge |
+| A NUL byte in a name or a `status` filter | 500 from Postgres | 422; filters are enums |
+| `monthly_salary: ""` | Schema said "any string"; the API refused it | Schema publishes the exact money format |
+| 404, 409 and unparseable-body 400 | Not in the schema at all | Documented on every route |
+| Business-rule errors | A 422 whose body broke the documented 422 shape | 409 with a documented body; 422 means "breaks the schema" |
+| `OPTIONS /departments` | `Allow: GET`, although POST exists | Lists every method on the path |
+| `\s` in published patterns | Server and schema validators disagreed on Unicode spaces | Patterns spell out the characters |
+
+One exception is explicit in the test: JSON Schema cannot say "end date on or
+after start date", so `POST /leave-requests` is excused from the
+"schema-valid requests are accepted" check. Every other check still runs on it.
 
 ## License
 

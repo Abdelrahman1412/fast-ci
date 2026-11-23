@@ -219,6 +219,36 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Schema-driven API fuzz, 25 generated requests per operation. It runs in its
+  # own job because Schemathesis creates its tests at run time, so a shard file
+  # cannot select them by node id. The nightly api-fuzz workflow runs 1,000.
+  api-fuzz:
+    needs: [plan, test-db]
+    if: needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: ${{ needs.plan.outputs.postgres_image }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-backend
+      - uses: ./.github/actions/test-db
+        with:
+          fingerprint: ${{ needs.plan.outputs.migration_fingerprint }}
+          migrate-command: ${{ needs.plan.outputs.migrate_command }}
+          postgres-container: ${{ job.services.postgres.id }}
+      - name: Fuzz every operation
+        working-directory: backend
+        env:
+          FASTCI_REQUIRE_TEMPLATE: '1'
+        run: uv run pytest tests/fuzz -p no:cacheprovider
+
   # Proves the shards together ran exactly the collected tests, applies the
   # rerun policy, and publishes merged durations for the next split.
   gate:
@@ -254,7 +284,7 @@ jobs:
 
   ci-result:
     name: CI result
-    needs: [plan, lint, test-db, collect, test, gate]
+    needs: [plan, lint, test-db, collect, test, gate, api-fuzz]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

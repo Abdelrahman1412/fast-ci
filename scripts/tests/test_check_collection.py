@@ -67,6 +67,15 @@ def test_ignore_list_allows_deliberate_exceptions(tmp_path):
     assert result.returncode == 0, result.stdout
 
 
+def test_ignored_test_modules_are_not_collected(tmp_path):
+    # A suite that runs in its own job (here: a schema fuzzer) must not leak into the shard files.
+    out = tmp_path / "collected.txt"
+    project = make_project(tmp_path, {"tests/fuzz/test_api_fuzz.py": GOOD})
+    result = guard(project, "--ignore", "tests/fuzz/*", "--out", str(out))
+    assert result.returncode == 0, result.stdout
+    assert out.read_text() == "tests/test_good.py::test_ok\n"
+
+
 def test_writes_collected_node_ids(tmp_path):
     out = tmp_path / "collected.txt"
     result = guard(make_project(tmp_path, {}), "--out", str(out))

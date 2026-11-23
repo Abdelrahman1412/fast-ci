@@ -10,3 +10,4 @@ frontend/dist-listed.json
 frontend/playwright-report/
 frontend/test-results/
 frontend/blob-report/
+.hypothesis/

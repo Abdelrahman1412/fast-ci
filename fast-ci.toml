@@ -10,8 +10,11 @@ root = "backend"
 tests = ["tests"]
 python_files = ["test_*.py"]
 # Files under the test roots that may define test-like functions but are not
-# test modules (glob, relative to root). Everything else must be collected.
-collection_ignore = []
+# test modules, or suites that run in their own job (glob, relative to root).
+# They are left out of the shard files. Everything else must be collected.
+# The API fuzzer runs in the "api-fuzz" job: Schemathesis creates its tests at
+# run time, so they cannot be selected by node id from a shard file.
+collection_ignore = ["tests/fuzz/*"]
 # Number of parallel test jobs. Wall clock ~ total test time / shards + fixed
 # cost per job (checkout, install, database restore). Past the point where the
 # fixed cost dominates, more shards only cost money.

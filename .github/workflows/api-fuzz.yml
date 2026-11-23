@@ -1,0 +1,48 @@
+name: api-fuzz
+
+# Pushes fuzz every operation with 25 generated requests inside the sharded
+# backend run. This nightly job searches much deeper: 1,000 per operation.
+on:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PGHOST: 127.0.0.1
+  PGPORT: 5432
+  PGUSER: postgres
+  PGPASSWORD: postgres
+  FASTCI_BASE_DB: acme_test_base
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read fast-ci.toml
+        id: config
+        run: python3 scripts/ci_config.py backend --github-output
+      - uses: ./.github/actions/setup-backend
+      - uses: ./.github/actions/test-db
+        with:
+          fingerprint: ${{ steps.config.outputs.migration_fingerprint }}
+          migrate-command: ${{ steps.config.outputs.migrate_command }}
+          postgres-container: ${{ job.services.postgres.id }}
+      - name: Fuzz every operation (1,000 requests each)
+        working-directory: backend
+        env:
+          FUZZ_EXAMPLES: "1000"
+          FASTCI_REQUIRE_TEMPLATE: "1"
+        run: uv run pytest tests/fuzz -p no:cacheprovider

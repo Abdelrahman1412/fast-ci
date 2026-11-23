@@ -17,6 +17,7 @@ dev = [
     "pytest>=9.2.0",
     "pytest-rerunfailures>=16.7",
     "ruff>=0.17.6",
+    "schemathesis>=4.34.0",
 ]
 
 [tool.pytest.ini_options]

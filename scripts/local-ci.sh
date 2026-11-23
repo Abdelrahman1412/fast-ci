@@ -30,7 +30,9 @@ FASTCI_FINGERPRINT=$(cfg migration_fingerprint) FASTCI_MIGRATE_CMD=$(cfg migrate
   FASTCI_DUMP="$repo/.cache/test-db/base.dump" "$repo/scripts/test_db.sh" ensure
 
 echo "== collection guard"
+# shellcheck disable=SC2046
 uv run python "$repo/scripts/check_collection.py" --root . --tests tests --pytest "uv run python -m pytest" \
+  --ignore $(cfg collection_ignore | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)))') \
   --out "$out/collected.txt"
 
 echo "== split ($shards shards by $group_by)"
